@@ -84,7 +84,7 @@
 	status = "okay";
 };
 &usb_otg {
-	dr_mode = "peripheral";	// peripheral | otg | host
+	dr_mode = "otg";	// peripheral | otg | host
 	status = "okay";
 };
 &usbphy {
