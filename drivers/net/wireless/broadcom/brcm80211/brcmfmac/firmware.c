@@ -1,17 +1,6 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright (c) 2013 Broadcom Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 #include <linux/efi.h>
@@ -21,6 +10,7 @@
 #include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/bcm47xx_nvram.h>
+#include <linux/ctype.h>
 
 #include "debug.h"
 #include "firmware.h"
@@ -40,6 +30,8 @@ enum nvram_parser_state {
 	COMMENT,
 	END
 };
+
+char saved_ccode[2] = {};
 
 /**
  * struct nvram_parser - internal info for parser.
@@ -556,10 +548,26 @@ static int brcmf_fw_request_nvram_done(const struct firmware *fw, void *ctx)
 			goto fail;
 	}
 
-	if (data)
+	if (data) {
+		char *ccode = strnstr((char *)data, "ccode=", data_len);
+		/* Ensure this is a whole token */
+		if (ccode && ((void *)ccode == (void *)data || isspace(ccode[-1]))) {
+			/* Comment out the line */
+			ccode[0] = '#';
+			ccode += 6;
+			if (isupper(ccode[0]) && isupper(ccode[1]) &&
+			    isspace(ccode[2])) {
+				pr_debug("brcmfmac: intercepting ccode=%c%c\n",
+					 ccode[0], ccode[1]);
+				saved_ccode[0] = ccode[0];
+				saved_ccode[1] = ccode[1];
+			}
+		};
+
 		nvram = brcmf_fw_nvram_strip(data, data_len, &nvram_length,
 					     fwctx->req->domain_nr,
 					     fwctx->req->bus_nr);
+	}
 
 	if (free_bcm47xx_nvram)
 		bcm47xx_nvram_release_contents(data);

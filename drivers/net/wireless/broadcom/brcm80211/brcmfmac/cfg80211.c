@@ -1,27 +1,22 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright (c) 2010 Broadcom Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 /* Toplevel file. Relies on dhd_linux.c to send commands to the dongle. */
+
+#define NEXMON_MON_IF
 
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
+#include <linux/ctype.h>
 #include <net/cfg80211.h>
 #include <net/netlink.h>
+#ifdef NEXMON_MON_IF
+#include <linux/if_arp.h>
+#endif
 
 #include <brcmu_utils.h>
 #include <defs.h>
@@ -200,9 +195,9 @@ static const struct ieee80211_regdomain brcmf_regdom = {
 		 */
 		REG_RULE(2484-10, 2484+10, 20, 6, 20, 0),
 		/* IEEE 802.11a, channel 36..64 */
-		REG_RULE(5150-10, 5350+10, 80, 6, 20, 0),
+		REG_RULE(5150-10, 5350+10, 160, 6, 20, 0),
 		/* IEEE 802.11a, channel 100..165 */
-		REG_RULE(5470-10, 5850+10, 80, 6, 20, 0), }
+		REG_RULE(5470-10, 5850+10, 160, 6, 20, 0), }
 };
 
 /* Note: brcmf_cipher_suites is an array of int defining which cipher suites
@@ -287,8 +282,26 @@ static u16 chandef_to_chanspec(struct brcmu_d11inf *d11inf,
 		else
 			ch_inf.sb = BRCMU_CHAN_SB_UU;
 		break;
-	case NL80211_CHAN_WIDTH_80P80:
 	case NL80211_CHAN_WIDTH_160:
+		ch_inf.bw = BRCMU_CHAN_BW_160;
+		if (primary_offset == -70)
+			ch_inf.sb = BRCMU_CHAN_SB_LLL;
+		else if (primary_offset == -50)
+			ch_inf.sb = BRCMU_CHAN_SB_LLU;
+		else if (primary_offset == -30)
+			ch_inf.sb = BRCMU_CHAN_SB_LUL;
+		else if (primary_offset == -10)
+			ch_inf.sb = BRCMU_CHAN_SB_LUU;
+		else if (primary_offset == 10)
+			ch_inf.sb = BRCMU_CHAN_SB_ULL;
+		else if (primary_offset == 30)
+			ch_inf.sb = BRCMU_CHAN_SB_ULU;
+		else if (primary_offset == 50)
+			ch_inf.sb = BRCMU_CHAN_SB_UUL;
+		else
+			ch_inf.sb = BRCMU_CHAN_SB_UUU;
+		break;
+	case NL80211_CHAN_WIDTH_80P80:
 	case NL80211_CHAN_WIDTH_5:
 	case NL80211_CHAN_WIDTH_10:
 	default:
@@ -307,6 +320,7 @@ static u16 chandef_to_chanspec(struct brcmu_d11inf *d11inf,
 	}
 	d11inf->encchspec(&ch_inf);
 
+	brcmf_dbg(TRACE, "chanspec: 0x%x\n", ch_inf.chspec);
 	return ch_inf.chspec;
 }
 
@@ -437,6 +451,20 @@ static int brcmf_vif_add_validate(struct brcmf_cfg80211_info *cfg,
 		params.iftype_num[pos->wdev.iftype]++;
 
 	params.iftype_num[new_type]++;
+
+#ifdef NEXMON_MON_IF
+	//Return not supported if hostapd tries to add a second monitor interface
+	if (new_type == NL80211_IFTYPE_MONITOR)
+	{    
+		brcmf_err("Attempt to add a MONITOR interface...\n");
+		if (params.iftype_num[new_type] > 1) 
+		{
+			brcmf_err("... there is already a monitor interface, returning EOPNOTSUPP\n");
+			return -EOPNOTSUPP;
+		}
+	}
+#endif
+
 	return cfg80211_check_combinations(cfg->wiphy, &params);
 }
 
@@ -530,6 +558,97 @@ static int brcmf_cfg80211_request_ap_if(struct brcmf_if *ifp)
 
 	return err;
 }
+
+#ifdef NEXMON_MON_IF
+
+/**
+ * brcmf_mon_add_vif() - create a new MONITOR virtual interface
+ *
+ * @wiphy: wiphy device of new interface.
+ * @name: name of the new interface.
+ * @params: contains mac address for MONITOR device.
+ */
+//static
+struct wireless_dev *brcmf_mon_add_vif(struct wiphy *wiphy, const char *name,
+				      struct vif_params *params)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_if *ifp = netdev_priv(cfg_to_ndev(cfg));
+	struct brcmf_cfg80211_vif *vif;
+	int err;
+
+	brcmf_err("brcmf_mon_add_vif called\n");
+
+	if (brcmf_cfg80211_vif_event_armed(cfg))
+		return ERR_PTR(-EBUSY);
+
+	brcmf_err("Adding vif \"%s\"\n", name);
+
+	vif = brcmf_alloc_vif(cfg, NL80211_IFTYPE_MONITOR);
+	if (IS_ERR(vif))
+		return (struct wireless_dev *)vif;
+
+	brcmf_cfg80211_arm_vif_event(cfg, vif);
+
+	err = brcmf_cfg80211_request_ap_if(ifp); // ????? analyze
+	if (err) {
+		brcmf_cfg80211_arm_vif_event(cfg, NULL);
+		goto fail;
+	}
+
+	/* wait for firmware event */
+	err = brcmf_cfg80211_wait_vif_event(cfg, BRCMF_E_IF_ADD,
+					    BRCMF_VIF_EVENT_TIMEOUT);
+	brcmf_cfg80211_arm_vif_event(cfg, NULL);
+	if (!err) {
+		brcmf_err("timeout occurred\n");
+		err = -EIO;
+		goto fail;
+	}
+
+	/* interface created in firmware */
+	ifp = vif->ifp;
+	if (!ifp) {
+		brcmf_err("no if pointer provided\n");
+		err = -ENOENT;
+		goto fail;
+	}
+
+	strncpy(ifp->ndev->name, name, sizeof(ifp->ndev->name) - 1);
+	err = brcmf_net_attach(ifp, true);
+	if (err) {
+		brcmf_err("Registering netdevice failed\n");
+		goto fail;
+	}
+
+
+	//Try to change the ndev to be flagged with "monitor mode"  before going on
+	ifp->ndev->type = ARPHRD_IEEE80211_RADIOTAP;
+	ifp->ndev->ieee80211_ptr->iftype = NL80211_IFTYPE_MONITOR;
+
+	return &ifp->vif->wdev;
+
+ fail:
+	brcmf_free_vif(vif);
+	return ERR_PTR(err);
+}
+
+static s32
+brcmf_cfg80211_nexmon_set_channel(struct wiphy *wiphy,struct cfg80211_chan_def *chandef) {
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_if *ifp = netdev_priv(cfg_to_ndev(cfg));
+	s32 err = 0;
+	u16 chanspec;
+
+	//brcmf_err("DEBUG NexMon: brcmf_cfg80211_nexmon_set_channel() called!\n");
+	chanspec = chandef_to_chanspec(&cfg->d11inf, chandef);
+	err = brcmf_fil_iovar_int_set(ifp, "chanspec", chanspec);
+	if (err < 0) {
+		brcmf_err("Set Channel failed: chspec=%d, %d\n", chanspec, err);
+	}
+	return 0;
+}
+#endif
 
 /**
  * brcmf_ap_add_vif() - create a new AP virtual interface for multiple BSS
@@ -633,9 +752,16 @@ static struct wireless_dev *brcmf_cfg80211_add_iface(struct wiphy *wiphy,
 	case NL80211_IFTYPE_STATION:
 	case NL80211_IFTYPE_AP_VLAN:
 	case NL80211_IFTYPE_WDS:
+#ifndef NEXMON_MON_IF
 	case NL80211_IFTYPE_MONITOR:
+#endif
 	case NL80211_IFTYPE_MESH_POINT:
 		return ERR_PTR(-EOPNOTSUPP);
+#ifdef NEXMON_MON_IF
+	case NL80211_IFTYPE_MONITOR:
+		wdev = brcmf_mon_add_vif(wiphy, name, params);
+		break;
+#endif
 	case NL80211_IFTYPE_AP:
 		wdev = brcmf_ap_add_vif(wiphy, name, params);
 		break;
@@ -818,9 +944,14 @@ int brcmf_cfg80211_del_iface(struct wiphy *wiphy, struct wireless_dev *wdev)
 	case NL80211_IFTYPE_STATION:
 	case NL80211_IFTYPE_AP_VLAN:
 	case NL80211_IFTYPE_WDS:
+#ifndef NEXMON_MON_IF
 	case NL80211_IFTYPE_MONITOR:
+#endif
 	case NL80211_IFTYPE_MESH_POINT:
 		return -EOPNOTSUPP;
+#ifdef NEXMON_MON_IF
+	case NL80211_IFTYPE_MONITOR:
+#endif
 	case NL80211_IFTYPE_AP:
 		return brcmf_cfg80211_del_ap_iface(wiphy, wdev);
 	case NL80211_IFTYPE_P2P_CLIENT:
@@ -887,6 +1018,10 @@ brcmf_cfg80211_change_iface(struct wiphy *wiphy, struct net_device *ndev,
 	}
 	switch (type) {
 	case NL80211_IFTYPE_MONITOR:
+#ifdef NEXMON_MON_IF
+		infra = 1;
+		break;
+#endif
 	case NL80211_IFTYPE_WDS:
 		bphy_err(drvr, "type (%d) : currently we do not support this type\n",
 			 type);
@@ -1278,17 +1413,21 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(vif->wdev.wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
+	bool bus_up = drvr->bus_if->state == BRCMF_BUS_UP;
 	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
 	if (test_and_clear_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state)) {
-		brcmf_dbg(INFO, "Call WLC_DISASSOC to stop excess roaming\n");
-		err = brcmf_fil_cmd_data_set(vif->ifp,
-					     BRCMF_C_DISASSOC, NULL, 0);
-		if (err) {
-			bphy_err(drvr, "WLC_DISASSOC failed (%d)\n", err);
+		if (bus_up) {
+			brcmf_dbg(INFO, "Call WLC_DISASSOC to stop excess roaming\n");
+			err = brcmf_fil_cmd_data_set(vif->ifp,
+						     BRCMF_C_DISASSOC, NULL, 0);
+			if (err)
+				bphy_err(drvr, "WLC_DISASSOC failed (%d)\n",
+					 err);
 		}
+
 		if ((vif->wdev.iftype == NL80211_IFTYPE_STATION) ||
 		    (vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT))
 			cfg80211_disconnected(vif->wdev.netdev, reason, NULL, 0,
@@ -1298,7 +1437,8 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason)
 	clear_bit(BRCMF_SCAN_STATUS_SUPPRESS, &cfg->scan_status);
 	brcmf_btcoex_set_mode(vif, BRCMF_BTCOEX_ENABLED, 0);
 	if (vif->profile.use_fwsup != BRCMF_PROFILE_FWSUP_NONE) {
-		brcmf_set_pmk(vif->ifp, NULL, 0);
+		if (bus_up)
+			brcmf_set_pmk(vif->ifp, NULL, 0);
 		vif->profile.use_fwsup = BRCMF_PROFILE_FWSUP_NONE;
 	}
 	brcmf_dbg(TRACE, "Exit\n");
@@ -2767,7 +2907,7 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 		brcmf_dbg(INFO, "Do not enable power save for P2P clients\n");
 		pm = PM_OFF;
 	}
-	brcmf_dbg(INFO, "power save %s\n", (pm ? "enabled" : "disabled"));
+	brcmf_info("power save %s\n", (pm ? "enabled" : "disabled"));
 
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, pm);
 	if (err) {
@@ -2776,6 +2916,7 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 		else
 			bphy_err(drvr, "error (%d)\n", err);
 	}
+	brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret", 2000); /* 2000ms - the maximum */
 done:
 	brcmf_dbg(TRACE, "Exit\n");
 	return err;
@@ -2969,8 +3110,6 @@ static s32 brcmf_update_bss_info(struct brcmf_cfg80211_info *cfg,
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_bss_info_le *bi;
 	const struct brcmf_tlv *tim;
-	u16 beacon_interval;
-	u8 dtim_period;
 	size_t ie_len;
 	u8 *ie;
 	s32 err = 0;
@@ -2994,12 +3133,9 @@ static s32 brcmf_update_bss_info(struct brcmf_cfg80211_info *cfg,
 
 	ie = ((u8 *)bi) + le16_to_cpu(bi->ie_offset);
 	ie_len = le32_to_cpu(bi->ie_length);
-	beacon_interval = le16_to_cpu(bi->beacon_period);
 
 	tim = brcmf_parse_tlvs(ie, ie_len, WLAN_EID_TIM);
-	if (tim)
-		dtim_period = tim->data[1];
-	else {
+	if (!tim) {
 		/*
 		* active scan was done so we could not get dtim
 		* information out of probe response.
@@ -3011,7 +3147,6 @@ static s32 brcmf_update_bss_info(struct brcmf_cfg80211_info *cfg,
 			bphy_err(drvr, "wl dtim_assoc failed (%d)\n", err);
 			goto update_bss_info_out;
 		}
-		dtim_period = (u8)var;
 	}
 
 update_bss_info_out:
@@ -4215,10 +4350,8 @@ brcmf_parse_vndr_ies(const u8 *vndr_ie_buf, u32 vndr_ie_len,
 
 		vndr_ies->count++;
 
-		brcmf_dbg(TRACE, "** OUI %02x %02x %02x, type 0x%02x\n",
-			  parsed_info->vndrie.oui[0],
-			  parsed_info->vndrie.oui[1],
-			  parsed_info->vndrie.oui[2],
+		brcmf_dbg(TRACE, "** OUI %3ph, type 0x%02x\n",
+			  parsed_info->vndrie.oui,
 			  parsed_info->vndrie.oui_type);
 
 		if (vndr_ies->count >= VNDR_IE_PARSE_LIMIT)
@@ -4237,9 +4370,7 @@ next:
 static u32
 brcmf_vndr_ie(u8 *iebuf, s32 pktflag, u8 *ie_ptr, u32 ie_len, s8 *add_del_cmd)
 {
-
-	strncpy(iebuf, add_del_cmd, VNDR_IE_CMD_LEN - 1);
-	iebuf[VNDR_IE_CMD_LEN - 1] = '\0';
+	strscpy(iebuf, add_del_cmd, VNDR_IE_CMD_LEN);
 
 	put_unaligned_le32(1, &iebuf[VNDR_IE_COUNT_OFFSET]);
 
@@ -4344,12 +4475,10 @@ s32 brcmf_vif_set_mgmt_ie(struct brcmf_cfg80211_vif *vif, s32 pktflag,
 		for (i = 0; i < old_vndr_ies.count; i++) {
 			vndrie_info = &old_vndr_ies.ie_info[i];
 
-			brcmf_dbg(TRACE, "DEL ID : %d, Len: %d , OUI:%02x:%02x:%02x\n",
+			brcmf_dbg(TRACE, "DEL ID : %d, Len: %d , OUI:%3ph\n",
 				  vndrie_info->vndrie.id,
 				  vndrie_info->vndrie.len,
-				  vndrie_info->vndrie.oui[0],
-				  vndrie_info->vndrie.oui[1],
-				  vndrie_info->vndrie.oui[2]);
+				  vndrie_info->vndrie.oui);
 
 			del_add_ie_buf_len = brcmf_vndr_ie(curr_ie_buf, pktflag,
 							   vndrie_info->ie_ptr,
@@ -4381,12 +4510,10 @@ s32 brcmf_vif_set_mgmt_ie(struct brcmf_cfg80211_vif *vif, s32 pktflag,
 			remained_buf_len -= (vndrie_info->ie_len +
 					     VNDR_IE_VSIE_OFFSET);
 
-			brcmf_dbg(TRACE, "ADDED ID : %d, Len: %d, OUI:%02x:%02x:%02x\n",
+			brcmf_dbg(TRACE, "ADDED ID : %d, Len: %d, OUI:%3ph\n",
 				  vndrie_info->vndrie.id,
 				  vndrie_info->vndrie.len,
-				  vndrie_info->vndrie.oui[0],
-				  vndrie_info->vndrie.oui[1],
-				  vndrie_info->vndrie.oui[2]);
+				  vndrie_info->vndrie.oui);
 
 			del_add_ie_buf_len = brcmf_vndr_ie(curr_ie_buf, pktflag,
 							   vndrie_info->ie_ptr,
@@ -4996,18 +5123,16 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct net_device *ndev = wdev->netdev;
 	struct brcmf_pub *drvr = cfg->pub;
-	struct brcmf_if *ifp;
 	struct brcmu_chan ch;
 	enum nl80211_band band = 0;
 	enum nl80211_chan_width width = 0;
 	u32 chanspec;
 	int freq, err;
 
-	if (!ndev)
+	if (!ndev || drvr->bus_if->state != BRCMF_BUS_UP)
 		return -ENODEV;
-	ifp = netdev_priv(ndev);
 
-	err = brcmf_fil_iovar_int_get(ifp, "chanspec", &chanspec);
+	err = brcmf_fil_iovar_int_get(netdev_priv(ndev), "chanspec", &chanspec);
 	if (err) {
 		bphy_err(drvr, "chanspec failed (%d)\n", err);
 		return err;
@@ -5280,6 +5405,9 @@ static struct cfg80211_ops brcmf_cfg80211_ops = {
 	.crit_proto_start = brcmf_cfg80211_crit_proto_start,
 	.crit_proto_stop = brcmf_cfg80211_crit_proto_stop,
 	.tdls_oper = brcmf_cfg80211_tdls_oper,
+#ifdef NEXMON_MON_IF
+	.set_monitor_channel = brcmf_cfg80211_nexmon_set_channel,
+#endif
 	.update_connect_params = brcmf_cfg80211_update_conn_params,
 	.set_pmk = brcmf_cfg80211_set_pmk,
 	.del_pmk = brcmf_cfg80211_del_pmk,
@@ -6436,6 +6564,12 @@ brcmf_txrx_stypes[NUM_NL80211_IFTYPES] = {
 		      BIT(IEEE80211_STYPE_AUTH >> 4) |
 		      BIT(IEEE80211_STYPE_DEAUTH >> 4) |
 		      BIT(IEEE80211_STYPE_ACTION >> 4)
+#ifdef NEXMON_MON_IF
+	},
+	[NL80211_IFTYPE_MONITOR] = {
+		.tx = 0xffff,
+		.rx = 0xffff
+#endif
 	}
 };
 
@@ -6488,7 +6622,12 @@ static int brcmf_setup_ifmodes(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
 				 BIT(NL80211_IFTYPE_ADHOC) |
+#ifdef NEXMON_MON_IF
+				 BIT(NL80211_IFTYPE_AP) |
+				 BIT(NL80211_IFTYPE_MONITOR);
+#else
 				 BIT(NL80211_IFTYPE_AP);
+#endif
 
 	c = 0;
 	i = 0;
@@ -6497,6 +6636,10 @@ static int brcmf_setup_ifmodes(struct wiphy *wiphy, struct brcmf_if *ifp)
 		goto err;
 	c0_limits[i].max = 1;
 	c0_limits[i++].types = BIT(NL80211_IFTYPE_STATION);
+#ifdef NEXMON_MON_IF
+	c0_limits[i].max = 1;
+	c0_limits[i++].types = BIT(NL80211_IFTYPE_MONITOR);
+#endif
 	if (p2p) {
 		if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_MCHAN))
 			combo[c].num_different_channels = 2;
@@ -6529,6 +6672,10 @@ static int brcmf_setup_ifmodes(struct wiphy *wiphy, struct brcmf_if *ifp)
 		p2p_limits[i++].types = BIT(NL80211_IFTYPE_STATION);
 		p2p_limits[i].max = 1;
 		p2p_limits[i++].types = BIT(NL80211_IFTYPE_AP);
+#ifdef NEXMON_MON_IF
+		p2p_limits[i].max = 1;
+		p2p_limits[i++].types = BIT(NL80211_IFTYPE_MONITOR);
+#endif
 		p2p_limits[i].max = 1;
 		p2p_limits[i++].types = BIT(NL80211_IFTYPE_P2P_CLIENT);
 		p2p_limits[i].max = 1;
@@ -6725,6 +6872,11 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 		}
 	}
 
+	if (wiphy->bands[NL80211_BAND_5GHZ] &&
+	    brcmf_feat_is_enabled(ifp, BRCMF_FEAT_DOT11H))
+		wiphy_ext_feature_set(wiphy,
+				      NL80211_EXT_FEATURE_DFS_OFFLOAD);
+
 	wiphy_read_of_freq_limits(wiphy);
 
 	return 0;
@@ -6822,6 +6974,24 @@ s32 brcmf_cfg80211_up(struct net_device *ndev)
 	err = __brcmf_cfg80211_up(ifp);
 	mutex_unlock(&cfg->usr_sync);
 
+#ifdef NEXMON_MON_IF
+	// Enable monitor mode
+	if (ifp->ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_MONITOR) {
+		unsigned int monitormode;
+		switch (ifp->ndev->type) {
+			case ARPHRD_IEEE80211_RADIOTAP:
+				monitormode = 2; // RADIOTAP ENABLED MONITOR MODE
+				break;
+			case ARPHRD_IEEE80211:
+				monitormode = 1; // MONITOR MODE WITHOUT RADIOTAP
+				break;
+			default:
+				monitormode = 0;
+		}
+		brcmf_fil_cmd_data_set(ifp, 108, &monitormode, 4);
+	}
+#endif
+
 	return err;
 }
 
@@ -6834,6 +7004,14 @@ s32 brcmf_cfg80211_down(struct net_device *ndev)
 	mutex_lock(&cfg->usr_sync);
 	err = __brcmf_cfg80211_down(ifp);
 	mutex_unlock(&cfg->usr_sync);
+
+#ifdef NEXMON_MON_IF
+	// Disable monitor mode
+	if (ifp->ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_MONITOR) {
+		unsigned int monitormode = 0; // DISABLE MONITOR MODE
+		brcmf_fil_cmd_data_set(ifp, 108, &monitormode, 4);
+	}
+#endif
 
 	return err;
 }
@@ -6906,12 +7084,18 @@ static s32 brcmf_translate_country_code(struct brcmf_pub *drvr, char alpha2[2],
 	struct brcmfmac_pd_cc *country_codes;
 	struct brcmfmac_pd_cc_entry *cc;
 	s32 found_index;
+	char ccode[BRCMF_COUNTRY_BUF_SZ];
+	int rev;
 	int i;
+
+	memcpy(ccode, alpha2, sizeof(ccode));
+	rev = -1;
 
 	country_codes = drvr->settings->country_codes;
 	if (!country_codes) {
-		brcmf_dbg(TRACE, "No country codes configured for device\n");
-		return -EINVAL;
+		brcmf_dbg(TRACE, "No country codes configured for device"
+				 " - use requested value\n");
+		goto use_input_value;
 	}
 
 	if ((alpha2[0] == ccreq->country_abbrev[0]) &&
@@ -6935,10 +7119,14 @@ static s32 brcmf_translate_country_code(struct brcmf_pub *drvr, char alpha2[2],
 		brcmf_dbg(TRACE, "No country code match found\n");
 		return -EINVAL;
 	}
-	memset(ccreq, 0, sizeof(*ccreq));
-	ccreq->rev = cpu_to_le32(country_codes->table[found_index].rev);
-	memcpy(ccreq->ccode, country_codes->table[found_index].cc,
+	rev = country_codes->table[found_index].rev;
+	memcpy(ccode, country_codes->table[found_index].cc,
 	       BRCMF_COUNTRY_BUF_SZ);
+
+use_input_value:
+	memset(ccreq, 0, sizeof(*ccreq));
+	ccreq->rev = cpu_to_le32(rev);
+	memcpy(ccreq->ccode, ccode, sizeof(ccode));
 	ccreq->country_abbrev[0] = alpha2[0];
 	ccreq->country_abbrev[1] = alpha2[1];
 	ccreq->country_abbrev[2] = 0;
@@ -6953,23 +7141,9 @@ static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
 	struct brcmf_if *ifp = brcmf_get_ifp(cfg->pub, 0);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_fil_country_le ccreq;
+	char *alpha2;
 	s32 err;
 	int i;
-
-	/* The country code gets set to "00" by default at boot, ignore */
-	if (req->alpha2[0] == '0' && req->alpha2[1] == '0')
-		return;
-
-	/* ignore non-ISO3166 country codes */
-	for (i = 0; i < 2; i++)
-		if (req->alpha2[i] < 'A' || req->alpha2[i] > 'Z') {
-			bphy_err(drvr, "not an ISO3166 code (0x%02x 0x%02x)\n",
-				 req->alpha2[0], req->alpha2[1]);
-			return;
-		}
-
-	brcmf_dbg(TRACE, "Enter: initiator=%d, alpha=%c%c\n", req->initiator,
-		  req->alpha2[0], req->alpha2[1]);
 
 	err = brcmf_fil_iovar_data_get(ifp, "country", &ccreq, sizeof(ccreq));
 	if (err) {
@@ -6977,7 +7151,35 @@ static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
 		return;
 	}
 
-	err = brcmf_translate_country_code(ifp->drvr, req->alpha2, &ccreq);
+	/* The country code gets set to "00" by default at boot - substitute
+	 * any saved ccode from the nvram file unless there is a valid code
+	 * already set.
+	 */
+	alpha2 = req->alpha2;
+	if (alpha2[0] == '0' && alpha2[1] == '0') {
+		extern char saved_ccode[2];
+
+		if ((isupper(ccreq.country_abbrev[0]) &&
+		     isupper(ccreq.country_abbrev[1])) ||
+		    !saved_ccode[0])
+			return;
+		alpha2 = saved_ccode;
+		pr_debug("brcmfmac: substituting saved ccode %c%c\n",
+			 alpha2[0], alpha2[1]);
+	}
+
+	/* ignore non-ISO3166 country codes */
+	for (i = 0; i < 2; i++)
+		if (alpha2[i] < 'A' || alpha2[i] > 'Z') {
+			bphy_err(drvr, "not an ISO3166 code (0x%02x 0x%02x)\n",
+				 alpha2[0], alpha2[1]);
+			return;
+		}
+
+	brcmf_dbg(TRACE, "Enter: initiator=%d, alpha=%c%c\n", req->initiator,
+		  alpha2[0], alpha2[1]);
+
+	err = brcmf_translate_country_code(ifp->drvr, alpha2, &ccreq);
 	if (err)
 		return;
 
@@ -7200,7 +7402,6 @@ void brcmf_cfg80211_detach(struct brcmf_cfg80211_info *cfg)
 	brcmf_pno_detach(cfg);
 	brcmf_btcoex_detach(cfg);
 	wiphy_unregister(cfg->wiphy);
-	kfree(cfg->ops);
 	wl_deinit_priv(cfg);
 	brcmf_free_wiphy(cfg->wiphy);
 	kfree(cfg);

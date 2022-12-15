@@ -1,17 +1,6 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright (c) 2010 Broadcom Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 #include <linux/types.h>
@@ -61,7 +50,7 @@
 #define CBUF_LEN	(128)
 
 /* Device console log buffer state */
-#define CONSOLE_BUFFER_MAX	2024
+#define CONSOLE_BUFFER_MAX	4096
 
 struct rte_log_le {
 	__le32 buf;		/* Can't be pointer on (64-bit) hosts */
@@ -615,12 +604,14 @@ BRCMF_FW_DEF(4329, "brcmfmac4329-sdio");
 BRCMF_FW_DEF(4330, "brcmfmac4330-sdio");
 BRCMF_FW_DEF(4334, "brcmfmac4334-sdio");
 BRCMF_FW_DEF(43340, "brcmfmac43340-sdio");
+BRCMF_FW_DEF(43341, "brcmfmac43341-sdio");
 BRCMF_FW_DEF(4335, "brcmfmac4335-sdio");
 BRCMF_FW_DEF(43362, "brcmfmac43362-sdio");
 BRCMF_FW_DEF(4339, "brcmfmac4339-sdio");
 BRCMF_FW_DEF(43430A0, "brcmfmac43430a0-sdio");
 /* Note the names are not postfixed with a1 for backward compatibility */
 BRCMF_FW_DEF(43430A1, "brcmfmac43430-sdio");
+BRCMF_FW_DEF(43436, "brcmfmac43436-sdio");
 BRCMF_FW_DEF(43455, "brcmfmac43455-sdio");
 BRCMF_FW_DEF(43456, "brcmfmac43456-sdio");
 BRCMF_FW_DEF(4354, "brcmfmac4354-sdio");
@@ -637,12 +628,13 @@ static const struct brcmf_firmware_mapping brcmf_sdio_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_4330_CHIP_ID, 0xFFFFFFFF, 4330),
 	BRCMF_FW_ENTRY(BRCM_CC_4334_CHIP_ID, 0xFFFFFFFF, 4334),
 	BRCMF_FW_ENTRY(BRCM_CC_43340_CHIP_ID, 0xFFFFFFFF, 43340),
-	BRCMF_FW_ENTRY(BRCM_CC_43341_CHIP_ID, 0xFFFFFFFF, 43340),
+	BRCMF_FW_ENTRY(BRCM_CC_43341_CHIP_ID, 0xFFFFFFFF, 43341),
 	BRCMF_FW_ENTRY(BRCM_CC_4335_CHIP_ID, 0xFFFFFFFF, 4335),
 	BRCMF_FW_ENTRY(BRCM_CC_43362_CHIP_ID, 0xFFFFFFFE, 43362),
 	BRCMF_FW_ENTRY(BRCM_CC_4339_CHIP_ID, 0xFFFFFFFF, 4339),
 	BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0x00000001, 43430A0),
-	BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0xFFFFFFFE, 43430A1),
+	BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0xFFFFFFFA, 43430A1),
+	BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0x00000004, 43436),
 	BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0x00000200, 43456),
 	BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0xFFFFFDC0, 43455),
 	BRCMF_FW_ENTRY(BRCM_CC_4354_CHIP_ID, 0xFFFFFFFF, 4354),
@@ -1945,7 +1937,10 @@ static uint brcmf_sdio_readframes(struct brcmf_sdio *bus, uint maxframes)
 			if (brcmf_sdio_hdparse(bus, bus->rxhdr, &rd_new,
 					       BRCMF_SDIO_FT_NORMAL)) {
 				rd->len = 0;
+				brcmf_sdio_rxfail(bus, true, true);
+				sdio_release_host(bus->sdiodev->func1);
 				brcmu_pkt_buf_free_skb(pkt);
+				continue;
 			}
 			bus->sdcnt.rx_readahead_cnt++;
 			if (rd->len != roundup(rd_new.len, 16)) {
@@ -3172,7 +3167,7 @@ static int brcmf_debugfs_sdio_count_read(struct seq_file *seq, void *data)
 	return 0;
 }
 
-static void brcmf_sdio_debugfs_create(struct device *dev)
+void brcmf_sdio_debugfs_create(struct device *dev)
 {
 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
 	struct brcmf_pub *drvr = bus_if->drvr;
@@ -3197,7 +3192,7 @@ static int brcmf_sdio_checkdied(struct brcmf_sdio *bus)
 	return 0;
 }
 
-static void brcmf_sdio_debugfs_create(struct device *dev)
+void brcmf_sdio_debugfs_create(struct device *dev)
 {
 }
 #endif /* DEBUG */
@@ -3693,7 +3688,11 @@ static void brcmf_sdio_bus_watchdog(struct brcmf_sdio *bus)
 			if (bus->idlecount > bus->idletime) {
 				brcmf_dbg(SDIO, "idle\n");
 				sdio_claim_host(bus->sdiodev->func1);
-				brcmf_sdio_wd_timer(bus, false);
+#ifdef DEBUG
+				if (!BRCMF_FWCON_ON() ||
+				    bus->console_interval == 0)
+#endif
+					brcmf_sdio_wd_timer(bus, false);
 				bus->idlecount = 0;
 				brcmf_sdio_bus_sleep(bus, true, false);
 				sdio_release_host(bus->sdiodev->func1);
@@ -4236,6 +4235,12 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 	}
 
 	if (err == 0) {
+		/* Assign bus interface call back */
+		sdiod->bus_if->dev = sdiod->dev;
+		sdiod->bus_if->ops = &brcmf_sdio_bus_ops;
+		sdiod->bus_if->chip = bus->ci->chip;
+		sdiod->bus_if->chiprev = bus->ci->chiprev;
+
 		/* Allow full data communication using DPC from now on. */
 		brcmf_sdiod_change_state(bus->sdiodev, BRCMF_SDIOD_DATA);
 
@@ -4252,23 +4257,26 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 
 	sdio_release_host(sdiod->func1);
 
-	/* Assign bus interface call back */
-	sdiod->bus_if->dev = sdiod->dev;
-	sdiod->bus_if->ops = &brcmf_sdio_bus_ops;
-	sdiod->bus_if->chip = bus->ci->chip;
-	sdiod->bus_if->chiprev = bus->ci->chiprev;
+	err = brcmf_alloc(sdiod->dev, sdiod->settings);
+	if (err) {
+		brcmf_err("brcmf_alloc failed\n");
+		goto claim;
+	}
 
 	/* Attach to the common layer, reserve hdr space */
-	err = brcmf_attach(sdiod->dev, sdiod->settings);
+	err = brcmf_attach(sdiod->dev);
 	if (err != 0) {
 		brcmf_err("brcmf_attach failed\n");
-		sdio_claim_host(sdiod->func1);
-		goto checkdied;
+		goto free;
 	}
 
 	/* ready */
 	return;
 
+free:
+	brcmf_free(sdiod->dev);
+claim:
+	sdio_claim_host(sdiod->func1);
 checkdied:
 	brcmf_sdio_checkdied(bus);
 release:
